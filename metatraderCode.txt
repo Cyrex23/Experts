@@ -1,0 +1,532 @@
+//+------------------------------------------------------------------+
+//|           Tri Arb AUDNZD/AUDCAD/NZDCAD - Mean Reversion EA      |
+//|           Triangular Arbitrage on AUD/NZD/CAD Triangle           |
+//+------------------------------------------------------------------+
+#property copyright "Tri Arb Strategy"
+#property version   "1.00"
+#property strict
+
+#include <Trade\Trade.mqh>
+#include <Trade\SymbolInfo.mqh>
+#include <Trade\AccountInfo.mqh>
+#include <Trade\PositionInfo.mqh>
+
+//--- Input Parameters
+input group "=== Pair Configuration ==="
+input string InpAUDNZD       = "AUDNZD";    // AUDNZD Symbol
+input string InpNZDCAD       = "NZDCAD";    // NZDCAD Symbol
+// AUDCAD is the chart symbol
+
+input group "=== Spread Settings ==="
+input int    InpSpreadLen    = 120;          // Spread MA Length
+input double InpEntryZ       = 2.0;         // Entry Threshold (Std Devs)
+input double InpExitZ        = 0.3;         // Exit Threshold (Std Devs)
+
+input group "=== Position Sizing ==="
+input double InpBaseLots     = 0.01;        // Base Lot Size
+input double InpRiskPct      = 2.0;         // Risk % of Equity (alt sizing)
+input bool   InpUseFixedLots = true;        // Use Fixed Lots (vs Risk%)
+
+input group "=== Scalp Settings ==="
+input double InpScalpTarget  = 0.15;        // Scalp Target %
+input int    InpMaxHoldBars  = 48;          // Max Hold Bars (base layer)
+
+input group "=== Martingale Settings ==="
+input bool   InpUseMartingale = true;       // Enable Martingale
+input int    InpMartLayers    = 5;          // Max Layers
+input double InpMartSpacing   = 0.25;       // Layer Spacing %
+input double InpMartMult      = 2.0;        // Volume Mult per Layer
+
+input group "=== Risk Management ==="
+input double InpMaxDDPct      = 55.0;       // Max Drawdown %
+input int    InpCooldownBars  = 12;         // Cooldown Bars After DD Stop
+input double InpMaxSpreadPips = 5.0;        // Max Spread to Enter (pips)
+
+input group "=== General ==="
+input int    InpMagicNumber   = 789456;     // Magic Number
+input int    InpSlippage      = 10;         // Max Slippage (points)
+
+//--- Global Variables
+CTrade         trade;
+CSymbolInfo    symAUDCAD, symAUDNZD, symNZDCAD;
+CAccountInfo   account;
+CPositionInfo  position;
+
+int    g_direction     = 0;      // 0=flat, 1=long, -1=short
+int    g_curLayer      = 0;
+double g_avgEntry      = 0.0;
+int    g_entryBarIdx   = 0;
+int    g_lastLayerBar  = 0;
+bool   g_ddFlag        = false;
+int    g_ddCoolEnd     = 0;
+double g_peakEquity    = 0.0;
+
+//--- Spread history ring buffer
+double g_spreadBuf[];
+int    g_spreadIdx     = 0;
+int    g_spreadCount   = 0;
+datetime g_lastBarTime = 0;
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                             |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   // Validate symbols exist
+   if(!SymbolSelect(InpAUDNZD, true))
+   {
+      Print("ERROR: Cannot find symbol ", InpAUDNZD);
+      return INIT_FAILED;
+   }
+   if(!SymbolSelect(InpNZDCAD, true))
+   {
+      Print("ERROR: Cannot find symbol ", InpNZDCAD);
+      return INIT_FAILED;
+   }
+   
+   // Initialize symbol info
+   symAUDCAD.Name(_Symbol);
+   symAUDNZD.Name(InpAUDNZD);
+   symNZDCAD.Name(InpNZDCAD);
+   
+   // Setup trade object
+   trade.SetExpertMagicNumber(InpMagicNumber);
+   trade.SetDeviationInPoints(InpSlippage);
+   trade.SetTypeFilling(ORDER_FILLING_IOC);
+   
+   // Initialize spread buffer
+   ArrayResize(g_spreadBuf, InpSpreadLen);
+   ArrayInitialize(g_spreadBuf, 0.0);
+   g_spreadIdx   = 0;
+   g_spreadCount = 0;
+   
+   // Initialize peak equity
+   g_peakEquity = account.Equity();
+   
+   // Check existing positions to restore state
+   RestoreState();
+   
+   Print("Tri Arb EA initialized on ", _Symbol);
+   Print("Triangle: ", _Symbol, " = ", InpAUDNZD, " x ", InpNZDCAD);
+   
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                           |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   Print("Tri Arb EA removed. Reason: ", reason);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                              |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // Only process on new bar
+   datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+   if(currentBarTime == g_lastBarTime)
+      return;
+   g_lastBarTime = currentBarTime;
+   
+   // Refresh symbol data
+   symAUDCAD.RefreshRates();
+   symAUDNZD.RefreshRates();
+   symNZDCAD.RefreshRates();
+   
+   // Get close prices
+   double audcadClose = symAUDCAD.Bid();
+   double audnzdClose = symAUDNZD.Bid();
+   double nzdcadClose = symNZDCAD.Bid();
+   
+   // Validate prices
+   if(audcadClose <= 0 || audnzdClose <= 0 || nzdcadClose <= 0)
+   {
+      Print("WARNING: Invalid prices - AUDCAD:", audcadClose, 
+            " AUDNZD:", audnzdClose, " NZDCAD:", nzdcadClose);
+      return;
+   }
+   
+   //--- Calculate spread
+   double rawSpread = MathLog(audcadClose) - MathLog(audnzdClose) - MathLog(nzdcadClose);
+   
+   // Add to ring buffer
+   g_spreadBuf[g_spreadIdx] = rawSpread;
+   g_spreadIdx = (g_spreadIdx + 1) % InpSpreadLen;
+   if(g_spreadCount < InpSpreadLen)
+      g_spreadCount++;
+   
+   // Need enough data
+   if(g_spreadCount < InpSpreadLen)
+   {
+      Print("Warming up: ", g_spreadCount, "/", InpSpreadLen, " bars");
+      return;
+   }
+   
+   //--- Calculate z-score
+   double spreadMA = 0.0, spreadSD = 0.0;
+   CalcStats(spreadMA, spreadSD);
+   
+   double zScore = (spreadSD > 0) ? (rawSpread - spreadMA) / spreadSD : 0.0;
+   
+   //--- Current bar index (approximation using bar count)
+   int barIdx = iBars(_Symbol, PERIOD_CURRENT);
+   
+   //--- Drawdown check
+   double curEquity = account.Equity();
+   if(curEquity > g_peakEquity)
+      g_peakEquity = curEquity;
+   
+   double ddPct = (g_peakEquity > 0) ? ((g_peakEquity - curEquity) / g_peakEquity) * 100.0 : 0.0;
+   bool   ddStop = (ddPct >= InpMaxDDPct);
+   bool   coolActive = g_ddFlag && (barIdx < g_ddCoolEnd);
+   
+   if(g_ddFlag && barIdx >= g_ddCoolEnd)
+      g_ddFlag = false;
+   
+   //--- DD Emergency Close
+   if(ddStop && g_direction != 0)
+   {
+      Print("DD STOP triggered at ", DoubleToString(ddPct, 1), "% drawdown");
+      CloseAllPositions("DD STOP");
+      ResetState();
+      g_ddFlag    = true;
+      g_ddCoolEnd = barIdx + InpCooldownBars;
+      return;
+   }
+   
+   //--- Check spread is acceptable for entry
+   double currentSpreadPips = symAUDCAD.Spread() * symAUDCAD.Point() / _Point;
+   bool   spreadOK = true; // simplified check
+   
+   //--- Entry signals
+   bool buySig  = (zScore < -InpEntryZ);
+   bool sellSig = (zScore >  InpEntryZ);
+   
+   //--- New entries
+   if(buySig && g_direction == 0 && !coolActive && !ddStop && spreadOK)
+   {
+      double lots = GetLots(0);
+      if(lots > 0)
+      {
+         string comment = "BUY z=" + DoubleToString(zScore, 2);
+         if(trade.Buy(lots, _Symbol, 0, 0, 0, comment))
+         {
+            g_direction    = 1;
+            g_curLayer     = 0;
+            g_avgEntry     = symAUDCAD.Ask();
+            g_entryBarIdx  = barIdx;
+            g_lastLayerBar = barIdx;
+            Print("ENTRY LONG: ", comment, " Lots=", lots, " Price=", g_avgEntry);
+         }
+      }
+   }
+   
+   if(sellSig && g_direction == 0 && !coolActive && !ddStop && spreadOK)
+   {
+      double lots = GetLots(0);
+      if(lots > 0)
+      {
+         string comment = "SELL z=" + DoubleToString(zScore, 2);
+         if(trade.Sell(lots, _Symbol, 0, 0, 0, comment))
+         {
+            g_direction    = -1;
+            g_curLayer     = 0;
+            g_avgEntry     = symAUDCAD.Bid();
+            g_entryBarIdx  = barIdx;
+            g_lastLayerBar = barIdx;
+            Print("ENTRY SHORT: ", comment, " Lots=", lots, " Price=", g_avgEntry);
+         }
+      }
+   }
+   
+   //--- Martingale layers
+   if(InpUseMartingale && g_direction != 0 && g_curLayer < InpMartLayers && !ddStop && g_avgEntry > 0)
+   {
+      double spacingAbs = g_avgEntry * (InpMartSpacing / 100.0);
+      int    minBars    = 3;
+      
+      if(g_direction == 1)
+      {
+         double trigPrice = g_avgEntry - spacingAbs * (g_curLayer + 1);
+         if(audcadClose <= trigPrice && (barIdx - g_lastLayerBar) >= minBars)
+         {
+            int nextLayer = g_curLayer + 1;
+            double lots   = GetLots(nextLayer);
+            if(lots > 0)
+            {
+               double oldTotal = GetTotalLots(g_curLayer);
+               double newPrice = symAUDCAD.Ask();
+               
+               string comment = "AVG BUY L" + IntegerToString(nextLayer);
+               if(trade.Buy(lots, _Symbol, 0, 0, 0, comment))
+               {
+                  g_avgEntry     = (g_avgEntry * oldTotal + newPrice * lots) / (oldTotal + lots);
+                  g_curLayer     = nextLayer;
+                  g_lastLayerBar = barIdx;
+                  Print("MART LAYER ", nextLayer, ": ", comment, " Lots=", lots, " AvgEntry=", g_avgEntry);
+               }
+            }
+         }
+      }
+      else if(g_direction == -1)
+      {
+         double trigPrice = g_avgEntry + spacingAbs * (g_curLayer + 1);
+         if(audcadClose >= trigPrice && (barIdx - g_lastLayerBar) >= minBars)
+         {
+            int nextLayer = g_curLayer + 1;
+            double lots   = GetLots(nextLayer);
+            if(lots > 0)
+            {
+               double oldTotal = GetTotalLots(g_curLayer);
+               double newPrice = symAUDCAD.Bid();
+               
+               string comment = "AVG SELL S" + IntegerToString(nextLayer);
+               if(trade.Sell(lots, _Symbol, 0, 0, 0, comment))
+               {
+                  g_avgEntry     = (g_avgEntry * oldTotal + newPrice * lots) / (oldTotal + lots);
+                  g_curLayer     = nextLayer;
+                  g_lastLayerBar = barIdx;
+                  Print("MART LAYER ", nextLayer, ": ", comment, " Lots=", lots, " AvgEntry=", g_avgEntry);
+               }
+            }
+         }
+      }
+   }
+   
+   //--- Exit logic
+   if(g_direction != 0)
+   {
+      bool meanRev  = (g_direction == 1 && zScore > -InpExitZ) || 
+                       (g_direction == -1 && zScore < InpExitZ);
+      
+      double pnlPct = 0.0;
+      if(g_direction == 1)
+         pnlPct = ((audcadClose - g_avgEntry) / g_avgEntry) * 100.0;
+      else if(g_direction == -1)
+         pnlPct = ((g_avgEntry - audcadClose) / g_avgEntry) * 100.0;
+      
+      bool scalpHit = (pnlPct >= InpScalpTarget);
+      bool timeout  = (g_curLayer == 0) && (barIdx - g_entryBarIdx >= InpMaxHoldBars);
+      
+      if(meanRev || scalpHit || timeout)
+      {
+         string exitReason = meanRev ? "MEAN REV" : scalpHit ? "SCALP" : "TIMEOUT";
+         if(g_curLayer > 0)
+            exitReason += " [" + IntegerToString(g_curLayer) + "L]";
+         
+         Print("EXIT: ", exitReason, " PnL%=", DoubleToString(pnlPct, 3), " Z=", DoubleToString(zScore, 3));
+         CloseAllPositions(exitReason);
+         ResetState();
+      }
+   }
+   
+   //--- Dashboard comment
+   string dashboard = "=== Tri Arb AUDNZD/AUDCAD/NZDCAD ===\n";
+   dashboard += "Z-Score: " + DoubleToString(zScore, 4) + "\n";
+   dashboard += "Direction: " + (g_direction == 1 ? "LONG" : g_direction == -1 ? "SHORT" : "FLAT") + "\n";
+   dashboard += "Layer: " + IntegerToString(g_curLayer) + "/" + IntegerToString(InpMartLayers) + "\n";
+   dashboard += "Avg Entry: " + (g_avgEntry > 0 ? DoubleToString(g_avgEntry, 5) : "—") + "\n";
+   dashboard += "Spread: " + DoubleToString(rawSpread, 8) + "\n";
+   dashboard += "DD: " + DoubleToString(ddPct, 1) + "% / " + DoubleToString(InpMaxDDPct, 0) + "%\n";
+   dashboard += "Equity: " + DoubleToString(curEquity, 2) + "\n";
+   dashboard += "Peak: " + DoubleToString(g_peakEquity, 2) + "\n";
+   dashboard += "Cool: " + (coolActive ? "ACTIVE" : "OFF") + "\n";
+   Comment(dashboard);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate mean and std dev from ring buffer                       |
+//+------------------------------------------------------------------+
+void CalcStats(double &mean, double &stddev)
+{
+   mean   = 0.0;
+   stddev = 0.0;
+   
+   if(g_spreadCount < InpSpreadLen)
+      return;
+   
+   // Calculate mean
+   double sum = 0.0;
+   for(int i = 0; i < InpSpreadLen; i++)
+      sum += g_spreadBuf[i];
+   mean = sum / InpSpreadLen;
+   
+   // Calculate standard deviation
+   double sumSq = 0.0;
+   for(int i = 0; i < InpSpreadLen; i++)
+   {
+      double diff = g_spreadBuf[i] - mean;
+      sumSq += diff * diff;
+   }
+   stddev = MathSqrt(sumSq / InpSpreadLen);
+}
+
+//+------------------------------------------------------------------+
+//| Get lot size for a given layer                                    |
+//+------------------------------------------------------------------+
+double GetLots(int layer)
+{
+   double lots = 0.0;
+   
+   if(InpUseFixedLots)
+   {
+      lots = InpBaseLots * MathPow(InpMartMult, layer);
+   }
+   else
+   {
+      // Risk-based sizing
+      double equity    = account.Equity();
+      double riskMoney = equity * (InpRiskPct / 100.0);
+      double tickValue = symAUDCAD.TickValue();
+      double tickSize  = symAUDCAD.TickSize();
+      
+      if(tickValue > 0 && tickSize > 0)
+      {
+         // Approximate lots based on risk
+         double stopDist  = g_avgEntry > 0 ? g_avgEntry * (InpMartSpacing / 100.0) : symAUDCAD.Bid() * 0.005;
+         double ticksRisk = stopDist / tickSize;
+         lots = (ticksRisk > 0) ? riskMoney / (ticksRisk * tickValue) : InpBaseLots;
+         lots *= MathPow(InpMartMult, layer);
+      }
+      else
+      {
+         lots = InpBaseLots * MathPow(InpMartMult, layer);
+      }
+   }
+   
+   // Normalize to broker requirements
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   
+   if(lotStep > 0)
+      lots = MathFloor(lots / lotStep) * lotStep;
+   
+   lots = MathMax(lots, minLot);
+   lots = MathMin(lots, maxLot);
+   
+   // Check margin
+   double marginReq = 0.0;
+   if(OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, lots, symAUDCAD.Ask(), marginReq))
+   {
+      double freeMargin = account.FreeMargin();
+      if(marginReq > freeMargin * 0.8) // Use max 80% of free margin
+      {
+         Print("WARNING: Insufficient margin. Required: ", marginReq, " Free: ", freeMargin);
+         // Reduce to fit
+         if(freeMargin > 0 && marginReq > 0)
+         {
+            lots = lots * (freeMargin * 0.8) / marginReq;
+            lots = MathFloor(lots / lotStep) * lotStep;
+            lots = MathMax(lots, minLot);
+         }
+         else
+         {
+            return 0.0;
+         }
+      }
+   }
+   
+   return lots;
+}
+
+//+------------------------------------------------------------------+
+//| Get total lots up to a given layer                                |
+//+------------------------------------------------------------------+
+double GetTotalLots(int upToLayer)
+{
+   double total = 0.0;
+   for(int i = 0; i <= upToLayer; i++)
+   {
+      if(InpUseFixedLots)
+         total += InpBaseLots * MathPow(InpMartMult, i);
+      else
+         total += InpBaseLots * MathPow(InpMartMult, i); // Simplified
+   }
+   return total;
+}
+
+//+------------------------------------------------------------------+
+//| Close all positions with our magic number                         |
+//+------------------------------------------------------------------+
+void CloseAllPositions(string reason)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(position.SelectByIndex(i))
+      {
+         if(position.Magic() == InpMagicNumber && position.Symbol() == _Symbol)
+         {
+            trade.PositionClose(position.Ticket(), InpSlippage);
+            Print("Closed position #", position.Ticket(), " Reason: ", reason, 
+                  " Profit: ", position.Profit());
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Reset internal state                                              |
+//+------------------------------------------------------------------+
+void ResetState()
+{
+   g_direction    = 0;
+   g_curLayer     = 0;
+   g_avgEntry     = 0.0;
+   g_entryBarIdx  = 0;
+   g_lastLayerBar = 0;
+}
+
+//+------------------------------------------------------------------+
+//| Restore state from existing positions (on restart)                |
+//+------------------------------------------------------------------+
+void RestoreState()
+{
+   double totalBuyLots  = 0.0;
+   double totalSellLots = 0.0;
+   double weightedBuy   = 0.0;
+   double weightedSell  = 0.0;
+   int    posCount      = 0;
+   
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(position.SelectByIndex(i))
+      {
+         if(position.Magic() == InpMagicNumber && position.Symbol() == _Symbol)
+         {
+            posCount++;
+            if(position.PositionType() == POSITION_TYPE_BUY)
+            {
+               totalBuyLots += position.Volume();
+               weightedBuy  += position.PriceOpen() * position.Volume();
+            }
+            else
+            {
+               totalSellLots += position.Volume();
+               weightedSell  += position.PriceOpen() * position.Volume();
+            }
+         }
+      }
+   }
+   
+   if(totalBuyLots > 0)
+   {
+      g_direction = 1;
+      g_avgEntry  = weightedBuy / totalBuyLots;
+      g_curLayer  = MathMax(0, posCount - 1);
+      Print("Restored LONG state: ", posCount, " positions, AvgEntry=", g_avgEntry);
+   }
+   else if(totalSellLots > 0)
+   {
+      g_direction = -1;
+      g_avgEntry  = weightedSell / totalSellLots;
+      g_curLayer  = MathMax(0, posCount - 1);
+      Print("Restored SHORT state: ", posCount, " positions, AvgEntry=", g_avgEntry);
+   }
+   
+   g_peakEquity = account.Equity();
+}
+//+------------------------------------------------------------------+
