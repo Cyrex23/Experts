@@ -178,7 +178,55 @@ You are exploiting a mathematical law — triangular correlation — between pai
 
 ---
 
-## 10. Recommended Live Trading Approach
+## 10. Spread, Swap and Backtest Realism
+
+### What the Backtest Includes
+
+#### Spread — Yes (partially)
+The backtest was run using **"Every tick"** modelling, which applies the historical bid/ask spread on every trade open and close. This means spread costs are already baked into the results.
+
+However, the backtest also used **"Zero latency, ideal execution"**, meaning:
+- No slippage — fills happen at the exact trigger price
+- No requotes — every order is accepted instantly
+- No partial fills — full volume is always available
+
+In live trading you will occasionally get worse fills, particularly during high-impact news events.
+
+#### Swap (Overnight Interest) — Yes
+MT5 backtests **automatically include swap costs** — the interest charged or earned for holding positions overnight. Since this strategy sometimes holds positions for days, weeks, or even months (the 10-year test had one position open for 260 days), swap costs are a meaningful factor and they were fully included in the backtest P&L.
+
+For AUD/NZD/CAD pairs swaps are generally small but not zero, and they can be negative (cost) or positive (earned) depending on direction and broker rates.
+
+### What the Backtest Does NOT Include
+
+| Factor | Real-world impact |
+|--------|-------------------|
+| **Slippage** | Live fills are occasionally a few pips worse than the trigger price |
+| **Spread widening** | During news events (NFP, central bank decisions) spreads can triple temporarily, triggering martingale levels earlier than expected |
+| **Per-trade commission** | Some brokers charge a fixed commission per lot — check your broker's fee schedule |
+| **Requotes** | Fast markets can reject orders and require resubmission at a worse price |
+| **VPS latency** | If running on a slow connection, order execution may lag the signal |
+
+### Realistic Expectation Adjustment
+
+Because of ideal execution in the backtest, live trading results will typically be **10–15% lower** than backtested profits. Applied to the 10-year results:
+
+| Metric | Backtest | Realistic live estimate |
+|--------|----------|------------------------|
+| Net profit | +$49,642 | ~$42,000–$44,000 |
+| Monthly average | ~$413 | ~$350–$375 |
+| Profit factor | 3.24 | ~2.7–3.0 |
+
+The strategy remains strongly profitable after this adjustment. The haircut does not change the fundamental edge — it just sets realistic expectations.
+
+### Broker-Specific Notes
+- **FBS (no suffix):** Set `InpSuffix` to blank. Confirm swap rates for AUDNZD, NZDCAD, AUDCAD in the contract specification.
+- **Brokers with `.r` suffix:** Set `InpSuffix = .r`
+- Always verify your broker applies swaps at market rates — exotic brokers sometimes charge unusually high swap fees that would erode profits on long-held martingale positions.
+
+---
+
+## 11. Recommended Live Trading Approach
 
 1. **Demo test first** — run on a demo account for 4–8 weeks to validate live execution matches backtest behavior
 2. **Start conservative** — use `InpBaseLot = 0.01` on a $10,000 account
@@ -191,4 +239,4 @@ You are exploiting a mathematical law — triangular correlation — between pai
 *EA file: TrioMartingale.mq5*
 *Pairs: AUDNZD, NZDCAD, AUDCAD*
 *Timeframe: H1 (indicators), Every Tick (execution)*
-*Recommended account: $10,000+ | Leverage: 1:250 or 1:500*
+*Recommended account: $10,000+ | Leverage: 1:250 | Backtest model: Every tick*

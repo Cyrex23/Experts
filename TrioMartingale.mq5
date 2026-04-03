@@ -8,11 +8,11 @@
 //|  - Uses martingale grid: doubles lot when price moves against    |
 //|  - Closes group when price recovers to avg entry + TP pips      |
 //|  - Emergency close of ALL positions at max drawdown %           |
-//|  - Designed for $10,000 account with 1:250 or 1:500 leverage    |
+//|  - Designed for $10,000 account with 1:250 leverage             |
 //+------------------------------------------------------------------+
 #property copyright   "Trio Martingale EA"
 #property description "Martingale grid for AUDNZD / NZDCAD / AUDCAD trio"
-#property version     "1.00"
+#property version     "1.01"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -24,7 +24,7 @@
 //-------------------------------------------------------------------
 
 input group "=== Symbol Settings ==="
-input string InpSuffix        = ".r";    // Broker symbol suffix (e.g. ".r", leave blank if none)
+input string InpSuffix        = "";     // Broker symbol suffix (e.g. ".r", leave blank if none)
 
 input group "=== Position Sizing ==="
 input double InpBaseLot       = 0.01;   // Base lot size (first entry per grid)
@@ -57,14 +57,12 @@ input int    InpSlippage      = 30;     // Maximum slippage (points)
 
 #define NUM_SYMS 3
 string BaseNames[NUM_SYMS] = {"AUDNZD", "NZDCAD", "AUDCAD"};
-string Syms[NUM_SYMS];         // Resolved symbol names (with suffix if needed)
-bool   SymOK[NUM_SYMS];        // Whether symbol was found
+string Syms[NUM_SYMS];
+bool   SymOK[NUM_SYMS];
 
-// Cached indicator handles (per symbol, created once in OnInit)
 int HndRSI[NUM_SYMS];
 int HndMA[NUM_SYMS];
 
-// Cooldown timestamps [symbol][0=buy, 1=sell]
 datetime LastEntry[NUM_SYMS][2];
 
 CTrade        Trade;
@@ -75,14 +73,13 @@ CAccountInfo  AccInf;
 // DATA STRUCTURES
 //-------------------------------------------------------------------
 
-// Aggregated info about one group of positions (same sym+magic+direction)
 struct GroupInfo {
-    int    count;        // Number of open positions
-    double totalLots;    // Sum of all volumes
-    double totalPL;      // Unrealized P&L (profit + swap + commission)
-    double vwap;         // Volume-weighted average open price
-    double maxLot;       // Largest single position volume
-    double extremePrice; // Most adverse price: lowest for buys, highest for sells
+    int    count;
+    double totalLots;
+    double totalPL;
+    double vwap;
+    double maxLot;
+    double extremePrice;
 };
 
 //-------------------------------------------------------------------
@@ -92,6 +89,8 @@ struct GroupInfo {
 int OnInit()
 {
     // --- Resolve symbol names ---
+    // Uses SYMBOL_EXIST instead of SYMBOL_BID so it works in the Strategy
+    // Tester where non-primary symbols have no live quote at OnInit time.
     for(int i = 0; i < NUM_SYMS; i++)
     {
         HndRSI[i] = INVALID_HANDLE;
@@ -99,7 +98,7 @@ int OnInit()
         SymOK[i]  = false;
 
         string candidate = BaseNames[i] + InpSuffix;
-        if(SymbolSelect(candidate, true) && SymbolInfoDouble(candidate, SYMBOL_BID) > 0)
+        if(SymbolSelect(candidate, true) && (bool)SymbolInfoInteger(candidate, SYMBOL_EXIST))
         {
             Syms[i] = candidate;
             SymOK[i] = true;
@@ -108,7 +107,7 @@ int OnInit()
         {
             // Fall back to base name without suffix
             candidate = BaseNames[i];
-            if(SymbolSelect(candidate, true) && SymbolInfoDouble(candidate, SYMBOL_BID) > 0)
+            if(SymbolSelect(candidate, true) && (bool)SymbolInfoInteger(candidate, SYMBOL_EXIST))
             {
                 Syms[i] = candidate;
                 SymOK[i] = true;
@@ -141,7 +140,7 @@ int OnInit()
 
     Trade.SetDeviationInPoints(InpSlippage);
 
-    Print("TrioMartingale initialized | Balance: ", AccInf.Balance(),
+    Print("TrioMartingale v1.01 initialized | Balance: ", AccInf.Balance(),
           " | Leverage: 1:", AccInf.Leverage(),
           " | MaxLevels: ", InpMaxLevels,
           " | GridPips: ", InpGridPips,
@@ -219,9 +218,9 @@ GroupInfo GetGroup(int symIdx, ENUM_POSITION_TYPE pType)
 
     for(int i = PositionsTotal() - 1; i >= 0; i--)
     {
-        if(!PosInf.SelectByIndex(i))    continue;
-        if(PosInf.Symbol()  != sym)     continue;
-        if(PosInf.Magic()   != magic)   continue;
+        if(!PosInf.SelectByIndex(i))       continue;
+        if(PosInf.Symbol()  != sym)        continue;
+        if(PosInf.Magic()   != magic)      continue;
         if(PosInf.PositionType() != pType) continue;
 
         double vol  = PosInf.Volume();
@@ -234,16 +233,13 @@ GroupInfo GetGroup(int symIdx, ENUM_POSITION_TYPE pType)
         sumPL       += open * vol;
         if(vol > g.maxLot) g.maxLot = vol;
 
-        // Track most adverse open price
         if(pType == POSITION_TYPE_BUY)
         {
-            // Worst = lowest price opened (most underwater)
             if(g.extremePrice == 0.0 || open < g.extremePrice)
                 g.extremePrice = open;
         }
         else
         {
-            // Worst = highest price opened
             if(g.extremePrice == 0.0 || open > g.extremePrice)
                 g.extremePrice = open;
         }
@@ -266,10 +262,10 @@ void CloseGroup(int symIdx, ENUM_POSITION_TYPE pType)
 
     for(int i = PositionsTotal() - 1; i >= 0; i--)
     {
-        if(!PosInf.SelectByIndex(i))         continue;
-        if(PosInf.Symbol()  != sym)          continue;
-        if(PosInf.Magic()   != magic)        continue;
-        if(PosInf.PositionType() != pType)   continue;
+        if(!PosInf.SelectByIndex(i))       continue;
+        if(PosInf.Symbol()  != sym)        continue;
+        if(PosInf.Magic()   != magic)      continue;
+        if(PosInf.PositionType() != pType) continue;
 
         bool ok = Trade.PositionClose(PosInf.Ticket());
         if(!ok)
@@ -314,14 +310,13 @@ bool MarketOpen(string sym)
     double bid = SymbolInfoDouble(sym, SYMBOL_BID);
     double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
     if(bid <= 0.0 || ask <= 0.0) return false;
-    // If spread is extremely wide the market is likely closed
     double maxSpreadPips = 10.0;
     double pip = PipSz(sym);
     return ((ask - bid) < maxSpreadPips * pip);
 }
 
 //-------------------------------------------------------------------
-// CORE: Process one symbol (manage existing groups + open new entries)
+// CORE: Process one symbol
 //-------------------------------------------------------------------
 
 void ProcessSymbol(int idx, double ddPct)
@@ -351,7 +346,6 @@ void ProcessSymbol(int idx, double ddPct)
 
         if(bid >= tpLevel)
         {
-            // Price recovered to VWAP + TP — take profit
             Print(sym, " BUY group TP | levels=", bg.count,
                   " lots=", bg.totalLots,
                   " vwap=", DoubleToString(bg.vwap, 5),
@@ -361,7 +355,6 @@ void ProcessSymbol(int idx, double ddPct)
         }
         else if(bg.count < InpMaxLevels)
         {
-            // Price dropped GridPips below last (extreme) entry → add martingale level
             double triggerPrice = bg.extremePrice - InpGridPips * pip;
             if(ask <= triggerPrice)
             {
@@ -371,8 +364,7 @@ void ProcessSymbol(int idx, double ddPct)
                 {
                     Print(sym, " +BUY level ", bg.count + 1,
                           " lot=", nextLot,
-                          " ask=", DoubleToString(ask, 5),
-                          " extremeWas=", DoubleToString(bg.extremePrice, 5));
+                          " ask=", DoubleToString(ask, 5));
                 }
                 else
                     Print(sym, " BUY add failed: ", Trade.ResultRetcodeDescription());
@@ -380,7 +372,6 @@ void ProcessSymbol(int idx, double ddPct)
         }
         else
         {
-            // Max levels reached — just wait for recovery
             if(bg.totalPL < 0.0)
                 PrintFormat("%s BUY maxed out (%d levels, %.2f PL) – waiting recovery",
                             sym, bg.count, bg.totalPL);
@@ -396,7 +387,6 @@ void ProcessSymbol(int idx, double ddPct)
 
         if(ask <= tpLevel)
         {
-            // Price dropped to VWAP - TP — take profit
             Print(sym, " SELL group TP | levels=", sg.count,
                   " lots=", sg.totalLots,
                   " vwap=", DoubleToString(sg.vwap, 5),
@@ -406,7 +396,6 @@ void ProcessSymbol(int idx, double ddPct)
         }
         else if(sg.count < InpMaxLevels)
         {
-            // Price rose GridPips above last (extreme) entry → add martingale level
             double triggerPrice = sg.extremePrice + InpGridPips * pip;
             if(bid >= triggerPrice)
             {
@@ -416,8 +405,7 @@ void ProcessSymbol(int idx, double ddPct)
                 {
                     Print(sym, " +SELL level ", sg.count + 1,
                           " lot=", nextLot,
-                          " bid=", DoubleToString(bid, 5),
-                          " extremeWas=", DoubleToString(sg.extremePrice, 5));
+                          " bid=", DoubleToString(bid, 5));
                 }
                 else
                     Print(sym, " SELL add failed: ", Trade.ResultRetcodeDescription());
@@ -432,27 +420,22 @@ void ProcessSymbol(int idx, double ddPct)
     }
 
     //================================================================
-    // OPEN NEW ENTRY (only if no group open in that direction)
+    // OPEN NEW ENTRY
     //================================================================
 
-    // Pause new entries when account drawdown is too high
     if(ddPct >= InpHedgeDDPct) return;
-
-    // Hard cap on total position count
     if(PositionsTotal() >= InpMaxTotalPos) return;
 
-    // Read indicators (shift=1 → last closed H1 bar)
     double rsi = BufVal(HndRSI[idx], 1);
     double ma  = BufVal(HndMA[idx],  1);
-    if(rsi <= 0.0 || ma <= 0.0) return; // Not enough history yet
+    if(rsi <= 0.0 || ma <= 0.0) return;
 
     datetime now = TimeCurrent();
     long cooldownSec = (long)InpCooldownMin * 60;
 
-    //--- NEW BUY ENTRY ---
     if(bg.count == 0)
     {
-        bool signalOK  = (rsi < InpRSIBuyLevel && bid < ma);
+        bool signalOK   = (rsi < InpRSIBuyLevel && bid < ma);
         bool cooldownOK = (now - LastEntry[idx][0]) >= cooldownSec;
 
         if(signalOK && cooldownOK)
@@ -469,7 +452,6 @@ void ProcessSymbol(int idx, double ddPct)
         }
     }
 
-    //--- NEW SELL ENTRY ---
     if(sg.count == 0)
     {
         bool signalOK   = (rsi > InpRSISellLevel && bid > ma);
@@ -496,13 +478,11 @@ void ProcessSymbol(int idx, double ddPct)
 
 void OnTick()
 {
-    // Throttle: process at most once every 5 seconds to save CPU
     static datetime lastTick = 0;
     datetime now = TimeCurrent();
     if(now - lastTick < 5 && lastTick != 0) return;
     lastTick = now;
 
-    //--- Emergency drawdown check ---
     double dd = DrawdownPct();
     if(dd >= InpMaxDDPct)
     {
@@ -510,13 +490,12 @@ void OnTick()
         return;
     }
 
-    //--- Process each symbol ---
     for(int i = 0; i < NUM_SYMS; i++)
         ProcessSymbol(i, dd);
 }
 
 //-------------------------------------------------------------------
-// TRADE EVENT — log fills for diagnostics
+// TRADE EVENT
 //-------------------------------------------------------------------
 
 void OnTradeTransaction(const MqlTradeTransaction& trans,
