@@ -9,10 +9,11 @@
 //|  - Closes group when price recovers to avg entry + TP pips      |
 //|  - Emergency close of ALL positions at max drawdown %           |
 //|  - Designed for $10,000 account with 1:250 leverage             |
+//|  - Dynamic lot sizing: scales automatically with account balance |
 //+------------------------------------------------------------------+
 #property copyright   "Trio Martingale EA"
 #property description "Martingale grid for AUDNZD / NZDCAD / AUDCAD trio"
-#property version     "1.01"
+#property version     "1.05"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -27,7 +28,9 @@ input group "=== Symbol Settings ==="
 input string InpSuffix        = "";     // Broker symbol suffix (e.g. ".r", leave blank if none)
 
 input group "=== Position Sizing ==="
-input double InpBaseLot       = 0.01;   // Base lot size (first entry per grid)
+input double InpBaseLotStep   = 0.01;   // Base lot at $10,000
+input double InpScaleExp      = 0.5;    // Scaling exponent: 0.5=sqrt, 0.7=moderate, 1.0=linear
+input double InpMaxBaseLot    = 0.10;   // Maximum base lot regardless of balance
 input double InpMultiplier    = 2.0;    // Martingale multiplier per level
 input int    InpMaxLevels     = 8;      // Maximum martingale levels per direction
 
@@ -105,7 +108,6 @@ int OnInit()
         }
         else
         {
-            // Fall back to base name without suffix
             candidate = BaseNames[i];
             if(SymbolSelect(candidate, true) && (bool)SymbolInfoInteger(candidate, SYMBOL_EXIST))
             {
@@ -122,7 +124,6 @@ int OnInit()
         }
         Print("Symbol OK: ", Syms[i]);
 
-        // --- Create indicator handles on H1 ---
         HndRSI[i] = iRSI(Syms[i], PERIOD_H1, InpRSIPeriod, PRICE_CLOSE);
         HndMA[i]  = iMA(Syms[i],  PERIOD_H1, InpMAPeriod,  0, MODE_EMA, PRICE_CLOSE);
 
@@ -133,15 +134,16 @@ int OnInit()
         }
     }
 
-    // --- Init cooldown timestamps ---
     for(int i = 0; i < NUM_SYMS; i++)
         for(int d = 0; d < 2; d++)
             LastEntry[i][d] = 0;
 
     Trade.SetDeviationInPoints(InpSlippage);
 
-    Print("TrioMartingale v1.01 initialized | Balance: ", AccInf.Balance(),
+    Print("TrioMartingale v1.04 initialized | Balance: ", AccInf.Balance(),
           " | Leverage: 1:", AccInf.Leverage(),
+          " | BaseLotStep: ", InpBaseLotStep,
+          " | MaxBaseLot: ", InpMaxBaseLot,
           " | MaxLevels: ", InpMaxLevels,
           " | GridPips: ", InpGridPips,
           " | TPPips: ", InpTPPips);
@@ -173,6 +175,26 @@ double NormLot(string sym, double lot)
     double mx   = SymbolInfoDouble(sym, SYMBOL_VOLUME_MAX);
     lot = MathFloor(lot / step) * step;
     return MathMax(mn, MathMin(mx, lot));
+}
+
+//-------------------------------------------------------------------
+// HELPER: Dynamic base lot based on current balance
+// Scales in clean steps of InpLotPer10k per $10,000
+//   $10,000 → 0.01 | $20,000 → 0.02 | $30,000 → 0.03 etc.
+// No intermediate values — only full $10k steps count.
+//-------------------------------------------------------------------
+
+double DynamicBaseLot(string sym)
+{
+    // Power scaling: lot = BaseLot * (balance / 10000) ^ InpScaleExp
+    // InpScaleExp = 0.5 → square root (conservative, slows at large balance)
+    // InpScaleExp = 0.7 → moderate (faster growth, more risk)
+    // InpScaleExp = 1.0 → linear (aggressive, matches old $10k-step behaviour)
+    double balance = AccInf.Balance();
+    if(balance <= 0.0) balance = 10000.0;
+    double lot = InpBaseLotStep * MathPow(balance / 10000.0, InpScaleExp);
+    lot = MathMin(lot, InpMaxBaseLot); // hard cap for safety
+    return NormLot(sym, lot);
 }
 
 //-------------------------------------------------------------------
@@ -440,7 +462,7 @@ void ProcessSymbol(int idx, double ddPct)
 
         if(signalOK && cooldownOK)
         {
-            double lot = NormLot(sym, InpBaseLot);
+            double lot = DynamicBaseLot(sym);
             if(Trade.Buy(lot, sym, ask, 0, 0, "Entry_Buy"))
             {
                 LastEntry[idx][0] = now;
@@ -459,7 +481,7 @@ void ProcessSymbol(int idx, double ddPct)
 
         if(signalOK && cooldownOK)
         {
-            double lot = NormLot(sym, InpBaseLot);
+            double lot = DynamicBaseLot(sym);
             if(Trade.Sell(lot, sym, bid, 0, 0, "Entry_Sell"))
             {
                 LastEntry[idx][1] = now;
